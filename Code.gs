@@ -22,6 +22,9 @@ const OFV_SEARCH_MAX_PAGES = 3;      // pages scanned per observation-field look
 const CACHE_TTL_SECONDS = 1800;      // successful lookups are reused for 30 minutes
 const MAX_PENDING_JOBS = 50;         // queued edit jobs kept while another run holds the lock
 const PROCESSING_NOTE_MAX_ROWS = 3;  // show the "Looking up…" note only for small jobs
+const PROCESS_CHUNK_ROWS = 30;       // rows looked up + written per checkpoint
+const PROCESS_TIME_BUDGET_MS = 270000; // stop ~4.5 min in (Apps Script kills runs at ~6 min)
+const CONTINUATION_HANDLER = 'processPendingJobsTrigger';
 
 // ====== Selectable Fields ======
 const OBSERVATION_FIELDS = [
@@ -145,6 +148,7 @@ function onInatEdit(e) {
   try {
     if (!e || !e.range) return;
     if (!isAutoLookupEnabled()) return;
+    startRunClock();
     const sheet = e.range.getSheet();
     if (sheet.getName() === LOG_SHEET_NAME) return;
 
@@ -177,6 +181,41 @@ function onInatEdit(e) {
     }
   } catch (err) {
     try { logSingleRow(0, 'Trigger', '', 'TriggerError', String(err && err.message ? err.message : err)); } catch (_) {}
+  }
+}
+
+// === RUN CLOCK ===
+// Apps Script hard-kills executions at ~6 minutes. Every entry point starts
+// this clock; long jobs stop before the limit, checkpoint what they have, and
+// queue the remainder for a continuation run.
+let RUN_DEADLINE = 0;
+function startRunClock() { RUN_DEADLINE = Date.now() + PROCESS_TIME_BUDGET_MS; }
+function pastDeadline() { return RUN_DEADLINE > 0 && Date.now() > RUN_DEADLINE; }
+
+/** Schedule a one-off continuation run (~1 min out) to drain the queue. */
+function scheduleContinuation() {
+  try {
+    const exists = ScriptApp.getProjectTriggers()
+      .some(t => t.getHandlerFunction() === CONTINUATION_HANDLER);
+    if (!exists) {
+      ScriptApp.newTrigger(CONTINUATION_HANDLER).timeBased().after(60 * 1000).create();
+    }
+  } catch (_) {}
+}
+
+function processPendingJobsTrigger() {
+  startRunClock();
+  try {
+    ScriptApp.getProjectTriggers().forEach(t => {
+      if (t.getHandlerFunction() === CONTINUATION_HANDLER) ScriptApp.deleteTrigger(t);
+    });
+  } catch (_) {}
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(30000)) { scheduleContinuation(); return; }
+  try {
+    drainPendingJobs();
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -216,9 +255,17 @@ function takePendingJobs() {
 
 function drainPendingJobs() {
   for (let i = 0; i < 20; i++) {
+    if (pastDeadline()) { scheduleContinuation(); return; }
     const jobs = takePendingJobs();
     if (!jobs.length) return;
-    jobs.forEach(runJob);
+    for (let j = 0; j < jobs.length; j++) {
+      if (pastDeadline()) {
+        jobs.slice(j).forEach(enqueueJob);
+        scheduleContinuation();
+        return;
+      }
+      runJob(jobs[j]);
+    }
   }
 }
 
@@ -227,11 +274,12 @@ function runJob(job) {
   if (!sheet) return;
   const rowEnd = Math.min(job.rowEnd, sheet.getLastRow());
   if (job.rowStart > rowEnd) return;
-  processRows(sheet, job.rowStart, rowEnd, { editedCols: job.editedCols, quiet: true });
+  processRows(sheet, job.rowStart, rowEnd, { editedCols: job.editedCols || null, quiet: true });
 }
 
 // === ENTRY POINTS (manual) ===
 function withDocumentLock(fn) {
+  startRunClock();
   const lock = LockService.getDocumentLock();
   if (!lock.tryLock(30000)) return uiToast('Another lookup is still running — try again shortly.');
   try {
@@ -333,93 +381,144 @@ function processRows(sheet, rowStart, rowEnd, opts) {
 
   const cache = getLookupCache();
   const logs = [];
-
-  // Phase 1 — id lookups, batched (one request per ID_BATCH_SIZE ids).
-  const idRows = rows.filter(x => x.name === 'id' && !x.invalid);
-  const obsById = fetchObservationsByIds([...new Set(idRows.map(x => x.value))], cache);
-
-  // Phase 2 — observation-field lookups, one search per unique (field, value).
-  const ofvRows = rows.filter(x => x.name !== 'id');
-  const ofvResults = new Map();
-  for (const x of ofvRows) {
-    const key = normalizeOFVName(x.name) + '|' + normalizeValue(x.value);
-    if (ofvResults.has(key)) continue;
-    const cached = cacheGet(cache, key);
-    if (cached) {
-      ofvResults.set(key, { obs: cached, note: '' });
-      continue;
-    }
-    try {
-      const found = searchObservationsForOFV(x.name, x.value);
-      if (found.obs) cachePut(cache, key, found.obs);
-      ofvResults.set(key, found);
-    } catch (e) {
-      ofvResults.set(key, { obs: null, note: '', error: String(e && e.message ? e.message : e) });
-    }
-    Utilities.sleep(REQUEST_DELAY_MS);
-  }
+  const runResults = new Map(); // lookup key -> {obs, note?, error?}
 
   // Column-value snapshots for the selected fields only (never rewrite
   // unrelated columns that happen to sit between two target columns).
   const colArrays = new Map();
   for (const c of targetCols) {
-    if (!colArrays.has(c)) {
-      colArrays.set(c, sheetData.map(row => [row[c]]));
-    }
+    if (!colArrays.has(c)) colArrays.set(c, sheetData.map(row => [row[c]]));
   }
 
   let filled = 0, notFound = 0, errors = 0;
-  for (const x of rows) {
-    const cell = sheet.getRange(x.r, x.colIndex + 1);
-    let obs = null, note = '', errMsg = '';
+  const deferredRows = []; // rows the time budget cut off
 
-    if (x.invalid) {
-      errMsg = 'Not a recognizable observation id or URL';
-    } else if (x.name === 'id') {
-      obs = obsById.get(x.value) || null;
-    } else {
-      const res = ofvResults.get(normalizeOFVName(x.name) + '|' + normalizeValue(x.value));
-      if (res) { obs = res.obs; note = res.note || ''; errMsg = res.error || ''; }
-    }
-
-    if (errMsg) {
-      errors++;
-      cell.setNote('Error: ' + errMsg);
-      logs.push([new Date(), sheet.getName(), x.r, x.name, x.value, 'Error', errMsg]);
-      continue;
-    }
-    if (!obs) {
-      notFound++;
-      cell.setNote(`Not found via ${x.name}`);
-      logs.push([new Date(), sheet.getName(), x.r, x.name, x.value, 'Not found', 'No observation matched']);
+  // Look up, fill, and WRITE a chunk of rows at a time, so a run that dies at
+  // the Apps Script execution limit keeps everything already checkpointed and
+  // the remainder continues in a later run instead of being lost.
+  for (let g = 0; g < rows.length; g += PROCESS_CHUNK_ROWS) {
+    const group = rows.slice(g, g + PROCESS_CHUNK_ROWS);
+    if (pastDeadline()) {
+      deferredRows.push(...group);
       continue;
     }
 
-    const values = buildRowValues(obs, selectedFields);
-    for (const f of selectedFields) {
-      const c = colMap[normalizeOFVName(f)];
-      if (c !== undefined) colArrays.get(c)[x.i][0] = values[f] ?? '';
+    // id lookups for this chunk — one batched request
+    const idsNeeded = [...new Set(group
+      .filter(x => x.name === 'id' && !x.invalid && !runResults.has(lookupKey(x)))
+      .map(x => x.value))];
+    if (idsNeeded.length) {
+      try {
+        const obsById = fetchObservationsByIds(idsNeeded, cache);
+        obsById.forEach((obs, id) => runResults.set('id|' + id, { obs }));
+      } catch (e) {
+        const msg = String(e && e.message ? e.message : e);
+        idsNeeded.forEach(id => runResults.set('id|' + id, { obs: null, error: msg }));
+      }
     }
-    filled++;
-    if (note) cell.setNote(note); else cell.clearNote();
-    logs.push([new Date(), sheet.getName(), x.r, x.name, x.value, 'OK',
-               note || `Filled ${selectedFields.length} field(s)`]);
+
+    // observation-field lookups for this chunk — one search per unique value
+    for (const x of group) {
+      if (x.name === 'id' || x.invalid) continue;
+      const key = lookupKey(x);
+      if (runResults.has(key)) continue;
+      const cached = cacheGet(cache, key);
+      if (cached) { runResults.set(key, { obs: cached }); continue; }
+      if (pastDeadline()) break;
+      try {
+        const found = searchObservationsForOFV(x.name, x.value);
+        if (found.obs) cachePut(cache, key, found.obs);
+        runResults.set(key, found);
+      } catch (e) {
+        runResults.set(key, { obs: null, error: String(e && e.message ? e.message : e) });
+      }
+      Utilities.sleep(REQUEST_DELAY_MS);
+    }
+
+    // fill this chunk's rows
+    let firstI = null, lastI = null;
+    for (const x of group) {
+      const cell = sheet.getRange(x.r, x.colIndex + 1);
+      let obs = null, note = '', errMsg = '';
+
+      if (x.invalid) {
+        errMsg = 'Not a recognizable observation id or URL';
+      } else {
+        const res = runResults.get(lookupKey(x));
+        if (!res) { deferredRows.push(x); continue; } // deadline hit before its lookup ran
+        obs = res.obs || null;
+        note = res.note || '';
+        errMsg = res.error || '';
+      }
+
+      if (firstI === null) firstI = x.i;
+      lastI = x.i;
+
+      if (errMsg) {
+        errors++;
+        cell.setNote('Error: ' + errMsg);
+        logs.push([new Date(), sheet.getName(), x.r, x.name, x.value, 'Error', errMsg]);
+        continue;
+      }
+      if (!obs) {
+        notFound++;
+        cell.setNote(`Not found via ${x.name}`);
+        logs.push([new Date(), sheet.getName(), x.r, x.name, x.value, 'Not found', 'No observation matched']);
+        continue;
+      }
+
+      const values = buildRowValues(obs, selectedFields);
+      for (const f of selectedFields) {
+        const c = colMap[normalizeOFVName(f)];
+        if (c !== undefined) colArrays.get(c)[x.i][0] = values[f] ?? '';
+      }
+      filled++;
+      if (note) cell.setNote(note); else cell.clearNote();
+      logs.push([new Date(), sheet.getName(), x.r, x.name, x.value, 'OK',
+                 note || `Filled ${selectedFields.length} field(s)`]);
+    }
+
+    // checkpoint: write this chunk's row span, one column at a time
+    if (firstI !== null) {
+      const span = lastI - firstI + 1;
+      for (const [c, arr] of colArrays) {
+        sheet.getRange(rowStart + firstI, c + 1, span, 1)
+             .setValues(arr.slice(firstI, lastI + 1));
+      }
+      SpreadsheetApp.flush();
+    }
   }
 
-  // Bulk write, one column at a time.
-  for (const [c, arr] of colArrays) {
-    sheet.getRange(rowStart, c + 1, numRows, 1).setValues(arr);
-  }
-  SpreadsheetApp.flush();
   writeLogsBulk(logs);
 
+  // Queue whatever the time budget cut off; a continuation run picks it up.
+  if (deferredRows.length) {
+    enqueueJob({
+      sheetName: sheet.getName(),
+      rowStart: Math.min.apply(null, deferredRows.map(x => x.r)),
+      rowEnd: rowEnd,
+      editedCols: opts.editedCols || null
+    });
+    scheduleContinuation();
+  }
+
   if (!opts.quiet) {
+    const done = rows.length - deferredRows.length;
     const parts = [`${filled} filled`];
     if (notFound) parts.push(`${notFound} not found`);
     if (errors) parts.push(`${errors} error(s)`);
     if (skipped) parts.push(`${skipped} skipped (no lookup value)`);
-    uiToast(`Processed ${rows.length} row(s): ${parts.join(', ')}`);
+    let msg = `Processed ${done} row(s): ${parts.join(', ')}`;
+    if (deferredRows.length) msg += `; ${deferredRows.length} more continue automatically in ~1 min`;
+    uiToast(msg);
   }
+}
+
+/** Cache/dedup key for a resolved lookup. */
+function lookupKey(x) {
+  return x.name.toLowerCase() === 'id'
+    ? 'id|' + x.value
+    : normalizeOFVName(x.name) + '|' + normalizeValue(x.value);
 }
 
 /**

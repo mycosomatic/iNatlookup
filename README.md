@@ -48,6 +48,12 @@ per spreadsheet.
 - **Rows the trigger can't run immediately are queued, not dropped.** If a
   long run holds the lock while you keep entering ids, those edits are
   stored and processed as soon as the running job finishes.
+- **Pasting a whole column of values is fine.** One paste is one job, blank
+  cells are skipped, and duplicate values are looked up once. Results are
+  written in chunks of ~30 rows as the run goes; if a very large paste
+  approaches Apps Script's ~6-minute execution limit, the remainder queues
+  itself and continues automatically about a minute later — no re-paste
+  needed.
 - Lookups by id are batched (100 per request); repeated lookups are served
   from a 30-minute cache; 429/5xx responses are retried with backoff.
 - Only the selected return columns are written. Failures put a note on the
