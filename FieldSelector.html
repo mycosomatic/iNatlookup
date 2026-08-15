@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <base target="_top">
+  <style>
+    body { font-family: Arial, sans-serif; padding: 12px; }
+    h2 { margin: 0 0 8px; font-size: 16px; }
+    .group { margin-bottom: 12px; }
+    .list { max-height: 220px; overflow: auto; border: 1px solid #ddd; padding: 8px; border-radius: 6px; }
+    label { display: block; margin: 4px 0; }
+    .row { display: flex; gap: 8px; margin: 10px 0 0; flex-wrap: wrap; }
+    button { padding: 8px 10px; }
+    .muted { color: #666; font-size: 12px; }
+    #filter { width: 100%; padding: 6px 8px; box-sizing: border-box; margin-bottom: 8px; border: 1px solid #ccc; border-radius: 6px; }
+    .hidden { display: none; }
+    #count { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h2>Select Return Fields</h2>
+  <div class="muted">Defaults: <span id="defaults"></span></div>
+
+  <input id="filter" type="text" placeholder="Filter fields…" autofocus>
+
+  <div class="group">
+    <strong>Observation Fields</strong>
+    <div id="obs" class="list"></div>
+  </div>
+
+  <div class="group">
+    <strong>Standard Metadata</strong>
+    <div id="meta" class="list"></div>
+  </div>
+
+  <div class="row">
+    <button id="saveBtn">Save Selection</button>
+    <button id="selectAll">Select All</button>
+    <button id="minimal">Minimal (defaults)</button>
+    <button id="clearAll">Clear</button>
+  </div>
+  <div class="muted" style="margin-top:6px;">
+    Selected: <span id="count">0</span>
+  </div>
+  <div class="muted" id="status"></div>
+
+  <script>
+    const preselected = <?!= JSON.stringify(data.preselected) ?>;
+    const obsFields   = <?!= JSON.stringify(data.observationFields) ?>;
+    const metaFields  = <?!= JSON.stringify(data.metadataFields) ?>;
+    const minimal     = <?!= JSON.stringify(data.defaults) ?>;
+
+    document.getElementById('defaults').textContent = minimal.join(', ');
+
+    function renderList(containerId, items) {
+      const el = document.getElementById(containerId);
+      el.innerHTML = '';
+      const selectedLower = preselected.map(s => s.toLowerCase());
+      items.forEach(name => {
+        const id = containerId + '_' + name.replace(/\s+/g, '_');
+        const checked = selectedLower.includes(name.toLowerCase());
+        el.insertAdjacentHTML('beforeend', `
+          <label data-name="${name.toLowerCase()}">
+            <input type="checkbox" value="${name}" id="${id}" ${checked ? 'checked' : ''}>
+            ${name}
+          </label>
+        `);
+      });
+    }
+
+    function getSelected() {
+      return Array.from(document.querySelectorAll('input[type=checkbox]'))
+        .filter(b => b.checked).map(b => b.value);
+    }
+    function setAll(state) {
+      document.querySelectorAll('label:not(.hidden) input[type=checkbox]').forEach(b => b.checked = state);
+      updateCount();
+    }
+    function setMinimal() {
+      document.querySelectorAll('input[type=checkbox]').forEach(b => {
+        b.checked = minimal.map(x => x.toLowerCase()).includes(b.value.toLowerCase());
+      });
+      updateCount();
+    }
+    function updateCount() {
+      document.getElementById('count').textContent = getSelected().length;
+    }
+    function applyFilter() {
+      const q = document.getElementById('filter').value.toLowerCase().trim();
+      document.querySelectorAll('label[data-name]').forEach(lbl => {
+        lbl.classList.toggle('hidden', q && !lbl.dataset.name.includes(q));
+      });
+    }
+
+    document.getElementById('saveBtn').addEventListener('click', () => {
+      const sel = getSelected();
+      document.getElementById('status').textContent = 'Saving…';
+      google.script.run
+        .withSuccessHandler(res => {
+          document.getElementById('status').textContent =
+            `Saved ${res.count} field(s).`;
+        })
+        .withFailureHandler(err => {
+          document.getElementById('status').textContent = 'Error: ' + (err && err.message ? err.message : err);
+        })
+        .saveSelectedFields(sel);
+    });
+    document.getElementById('selectAll').addEventListener('click', () => setAll(true));
+    document.getElementById('clearAll').addEventListener('click', () => setAll(false));
+    document.getElementById('minimal').addEventListener('click', setMinimal);
+    document.getElementById('filter').addEventListener('input', applyFilter);
+    document.body.addEventListener('change', e => {
+      if (e.target && e.target.type === 'checkbox') updateCount();
+    });
+
+    renderList('obs', obsFields);
+    renderList('meta', metaFields);
+    updateCount();
+  </script>
+</body>
+</html>
