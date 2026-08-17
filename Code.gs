@@ -91,10 +91,14 @@ const STANDARD_EXTRACTORS = {
 
 // === MENU ===
 function onOpen() {
+  // Contexts without a spreadsheet UI (editor Run button, mobile app, API
+  // opens) can't build a menu — skip quietly instead of logging an error.
+  let ui;
+  try { ui = SpreadsheetApp.getUi(); } catch (_) { return; }
   // Note: only reads a document property here — calling ScriptApp from onOpen
   // can throw in limited-auth contexts and would kill the whole menu.
   const autoOn = isAutoLookupEnabled();
-  SpreadsheetApp.getUi()
+  ui
     .createMenu(MENU_NAME)
     .addItem('Process All Rows', 'processAllRows')
     .addItem('Process Selected Rows', 'processSelectedRows')
