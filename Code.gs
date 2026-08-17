@@ -355,8 +355,10 @@ function processRows(sheet, rowStart, rowEnd, opts) {
   }
   if (rowStart > rowEnd) return;
 
-  // Force 'id' to be returned if using an alternative lookup column.
-  const hasAlternativeLookup = lookupCols.some(c => !isIdLookupName(c.name));
+  // Force 'id' to be returned if any lookup column other than a literal id
+  // column exists — including URL scan columns, so the clean numeric id
+  // always lands in its own column.
+  const hasAlternativeLookup = lookupCols.some(c => normalizeOFVName(c.name) !== 'id');
   if (hasAlternativeLookup && !selectedFields.some(f => f.toLowerCase() === 'id')) {
     selectedFields.unshift('id');
   }
