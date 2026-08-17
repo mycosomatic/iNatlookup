@@ -24,17 +24,22 @@ spreadsheet's bound script by hand (or wire up
 ## How a row is looked up
 
 Row 1 must be the header row. Any column whose header matches one of the
-lookup options — `id`, `Voucher Number(s)`, `FUNDIS Tag Number`,
-`Accession Number`, `GenBank Accession Number` — is a lookup column.
-Header matching ignores case, spacing, and punctuation, so
+lookup options — `id`, `iNat URL`, `Observation URL`, `Voucher Number(s)`,
+`FUNDIS Tag Number`, `Accession Number`, `GenBank Accession Number` — is a
+lookup column. Header matching ignores case, spacing, and punctuation, so
 `voucher numbers` matches `Voucher Number(s)`.
 
 - **Auto-lookup (edit trigger):** the column you actually edited is the
   one used. Clearing a cell does nothing (no fallback to another column).
-- **Manual runs (menu):** a filled `id` column wins (exact and fast);
+- **Manual runs (menu):** a filled id-style column wins (exact and fast);
   otherwise the first filled lookup column in header order is used.
-- The `id` column accepts a pasted observation URL
-  (`https://www.inaturalist.org/observations/12345`) as well as a bare id.
+- The three id-style columns (`id`, `iNat URL`, `Observation URL`) all
+  behave identically and accept either a bare observation id or a full
+  observation URL (`https://www.inaturalist.org/observations/12345`) —
+  QR-scan a label's URL straight into one of them; no splitting or
+  number-extraction formulas needed. Formula-computed cells never fire
+  edit triggers (a Sheets limitation), so scan into the lookup column
+  directly rather than deriving it with SPLIT/REGEXEXTRACT.
 - When a lookup goes through an observation field, `id` is always written
   back, so later runs can use the direct id path.
 - If several observations share the same observation-field value, the most

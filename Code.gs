@@ -59,14 +59,23 @@ const STANDARD_METADATA_FIELDS = [
 const DEFAULT_RETURN_FIELDS = ['URL', 'username', 'Voucher Number(s)', 'Scientific Name'];
 
 // The script watches any column whose header matches one of these
-// (matching ignores case, spacing, and punctuation).
+// (matching ignores case, spacing, and punctuation). The first three are
+// id-style columns: they accept a bare observation id or a full pasted or
+// QR-scanned observation URL, and resolve without an API search.
 const LOOKUP_OPTIONS = [
   'id',
+  'iNat URL',
+  'Observation URL',
   'Voucher Number(s)',
   'FUNDIS Tag Number',
   'Accession Number',
   'GenBank Accession Number'
 ];
+
+function isIdLookupName(name) {
+  const k = normalizeOFVName(name);
+  return k === 'id' || k === 'inaturl' || k === 'observationurl';
+}
 
 const STANDARD_EXTRACTORS = {
   'id':          o => o?.id ?? '',
@@ -347,7 +356,7 @@ function processRows(sheet, rowStart, rowEnd, opts) {
   if (rowStart > rowEnd) return;
 
   // Force 'id' to be returned if using an alternative lookup column.
-  const hasAlternativeLookup = lookupCols.some(c => c.name.toLowerCase() !== 'id');
+  const hasAlternativeLookup = lookupCols.some(c => !isIdLookupName(c.name));
   if (hasAlternativeLookup && !selectedFields.some(f => f.toLowerCase() === 'id')) {
     selectedFields.unshift('id');
   }
@@ -363,11 +372,10 @@ function processRows(sheet, rowStart, rowEnd, opts) {
   const sheetData = sheet.getRange(rowStart, 1, numRows, lastCol).getValues();
 
   // Resolve each row's lookup source.
-  const idCol = lookupCols.find(c => c.name.toLowerCase() === 'id') || null;
   const rows = [];
   let skipped = 0;
   for (let i = 0; i < numRows; i++) {
-    const resolved = resolveLookup(sheetData[i], lookupCols, idCol, opts.editedCols || null);
+    const resolved = resolveLookup(sheetData[i], lookupCols, opts.editedCols || null);
     if (!resolved) { skipped++; continue; }
     rows.push(Object.assign({ r: rowStart + i, i: i }, resolved));
   }
@@ -529,16 +537,22 @@ function lookupKey(x) {
  * Pick which lookup column drives a row.
  * Trigger mode (editedCols set): only the edited lookup column(s) count, and
  * an emptied cell means "skip", never "fall back to some other column".
- * Manual mode: a filled "id" column wins, then header order.
+ * Manual mode: a filled id-style column (id / iNat URL / Observation URL)
+ * wins, then header order.
  */
-function resolveLookup(rowValues, lookupCols, idCol, editedCols) {
-  const candidates = editedCols
-    ? lookupCols.filter(c => editedCols.indexOf(c.index) !== -1)
-    : ((idCol && String(rowValues[idCol.index]).trim()) ? [idCol] : lookupCols);
+function resolveLookup(rowValues, lookupCols, editedCols) {
+  let candidates;
+  if (editedCols) {
+    candidates = lookupCols.filter(c => editedCols.indexOf(c.index) !== -1);
+  } else {
+    const idLike = lookupCols.find(c =>
+      isIdLookupName(c.name) && String(rowValues[c.index]).trim());
+    candidates = idLike ? [idLike] : lookupCols;
+  }
   for (const col of candidates) {
     const raw = String(rowValues[col.index]).trim();
     if (!raw) continue;
-    if (col.name.toLowerCase() === 'id') {
+    if (isIdLookupName(col.name)) {
       const id = extractObservationId(raw);
       if (!id) return { name: 'id', value: raw, colIndex: col.index, invalid: true };
       return { name: 'id', value: id, colIndex: col.index };
