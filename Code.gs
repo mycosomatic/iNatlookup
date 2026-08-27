@@ -77,6 +77,13 @@ function isIdLookupName(name) {
   return k === 'id' || k === 'inaturl' || k === 'observationurl';
 }
 
+// Pair lookup: when a row has BOTH a username and an observed_on value (and
+// no id-style value), the two together find the observation — for collectors
+// who record "who + when" on a specimen instead of the observation number.
+// One observation that day matches outright; several match by nearest
+// observed time when a time is given, and refuse (with a note) when not.
+const USERDATE_NAME = 'username+observed_on';
+
 const STANDARD_EXTRACTORS = {
   'id':          o => o?.id ?? '',
   'URL':         o => o?.id ? `https://www.inaturalist.org/observations/${o.id}` : '',
@@ -169,17 +176,19 @@ function onInatEdit(e) {
     const rowEnd = e.range.getRow() + e.range.getNumRows() - 1;
     if (rowStart > rowEnd) return;
 
-    const { lookupCols } = readConfig(sheet);
-    if (!lookupCols.length) return;
+    const { lookupCols, userDate } = readConfig(sheet);
+    if (!lookupCols.length && !userDate) return;
 
     const colStart = e.range.getColumn();
     const colEnd = colStart + e.range.getNumColumns() - 1;
     const editedCols = lookupCols
       .filter(c => c.index + 1 >= colStart && c.index + 1 <= colEnd)
       .map(c => c.index);
-    if (!editedCols.length) return;
+    const udEdited = !!userDate && [userDate.userCol, userDate.dateCol]
+      .some(ci => ci + 1 >= colStart && ci + 1 <= colEnd);
+    if (!editedCols.length && !udEdited) return;
 
-    const job = { sheetName: sheet.getName(), rowStart, rowEnd, editedCols };
+    const job = { sheetName: sheet.getName(), rowStart, rowEnd, editedCols, udEdited };
     const lock = LockService.getDocumentLock();
     if (!lock.tryLock(20000)) {
       // A previous run is still busy — queue this edit instead of dropping it.
@@ -287,7 +296,11 @@ function runJob(job) {
   if (!sheet) return;
   const rowEnd = Math.min(job.rowEnd, sheet.getLastRow());
   if (job.rowStart > rowEnd) return;
-  processRows(sheet, job.rowStart, rowEnd, { editedCols: job.editedCols || null, quiet: true });
+  processRows(sheet, job.rowStart, rowEnd, {
+    editedCols: job.editedCols || null,
+    udEdited: !!job.udEdited,
+    quiet: true
+  });
 }
 
 // === ENTRY POINTS (manual) ===
@@ -349,16 +362,17 @@ function processRows(sheet, rowStart, rowEnd, opts) {
   const { lookupCols } = cfg;
   const selectedFields = cfg.selectedFields.slice();
 
-  if (!lookupCols.length) {
-    if (!opts.quiet) uiAlert('Could not find any lookup columns. Add a column named "id", "FUNDIS Tag Number", or "Voucher Number(s)".');
+  if (!lookupCols.length && !cfg.userDate) {
+    if (!opts.quiet) uiAlert('Could not find any lookup columns. Add a column named "id", "FUNDIS Tag Number", or "Voucher Number(s)" — or a "username" + "observed_on" pair.');
     return;
   }
   if (rowStart > rowEnd) return;
 
-  // Force 'id' to be returned if any lookup column other than a literal id
-  // column exists — including URL scan columns, so the clean numeric id
-  // always lands in its own column.
-  const hasAlternativeLookup = lookupCols.some(c => normalizeOFVName(c.name) !== 'id');
+  // Force 'id' to be returned if any lookup source other than a literal id
+  // column exists — URL scan columns and the username+observed_on pair
+  // included — so the clean numeric id always lands in its own column.
+  const hasAlternativeLookup = !!cfg.userDate ||
+    lookupCols.some(c => normalizeOFVName(c.name) !== 'id');
   if (hasAlternativeLookup && !selectedFields.some(f => f.toLowerCase() === 'id')) {
     selectedFields.unshift('id');
   }
@@ -377,7 +391,8 @@ function processRows(sheet, rowStart, rowEnd, opts) {
   const rows = [];
   let skipped = 0;
   for (let i = 0; i < numRows; i++) {
-    const resolved = resolveLookup(sheetData[i], lookupCols, opts.editedCols || null);
+    const resolved = resolveLookup(sheetData[i], lookupCols, cfg.userDate,
+                                   opts.editedCols || null, !!opts.udEdited);
     if (!resolved) { skipped++; continue; }
     rows.push(Object.assign({ r: rowStart + i, i: i }, resolved));
   }
@@ -431,7 +446,7 @@ function processRows(sheet, rowStart, rowEnd, opts) {
       }
     }
 
-    // observation-field lookups for this chunk — one search per unique value
+    // observation-field and username+date lookups — one search per unique key
     for (const x of group) {
       if (x.name === 'id' || x.invalid) continue;
       const key = lookupKey(x);
@@ -440,7 +455,9 @@ function processRows(sheet, rowStart, rowEnd, opts) {
       if (cached) { runResults.set(key, { obs: cached }); continue; }
       if (pastDeadline()) break;
       try {
-        const found = searchObservationsForOFV(x.name, x.value);
+        const found = x.kind === 'userdate'
+          ? searchByUserAndDate(x.login, x.when)
+          : searchObservationsForOFV(x.name, x.value);
         if (found.obs) cachePut(cache, key, found.obs);
         runResults.set(key, found);
       } catch (e) {
@@ -456,7 +473,7 @@ function processRows(sheet, rowStart, rowEnd, opts) {
       let obs = null, note = '', errMsg = '';
 
       if (x.invalid) {
-        errMsg = 'Not a recognizable observation id or URL';
+        errMsg = x.invalidMsg || 'Not a recognizable observation id or URL';
       } else {
         const res = runResults.get(lookupKey(x));
         if (!res) { deferredRows.push(x); continue; } // deadline hit before its lookup ran
@@ -476,8 +493,8 @@ function processRows(sheet, rowStart, rowEnd, opts) {
       }
       if (!obs) {
         notFound++;
-        cell.setNote(`Not found via ${x.name}`);
-        logs.push([new Date(), sheet.getName(), x.r, x.name, x.value, 'Not found', 'No observation matched']);
+        cell.setNote(note || `Not found via ${x.name}`);
+        logs.push([new Date(), sheet.getName(), x.r, x.name, x.value, 'Not found', note || 'No observation matched']);
         continue;
       }
 
@@ -530,39 +547,113 @@ function processRows(sheet, rowStart, rowEnd, opts) {
 
 /** Cache/dedup key for a resolved lookup. */
 function lookupKey(x) {
+  if (x.kind === 'userdate') {
+    return 'ud|' + x.login.toLowerCase() + '|' + x.when.date + '|' + (x.when.time || '');
+  }
   return x.name.toLowerCase() === 'id'
     ? 'id|' + x.value
     : normalizeOFVName(x.name) + '|' + normalizeValue(x.value);
 }
 
 /**
- * Pick which lookup column drives a row.
- * Trigger mode (editedCols set): only the edited lookup column(s) count, and
- * an emptied cell means "skip", never "fall back to some other column".
+ * Pick which lookup source drives a row.
+ * Trigger mode (editedCols set / udEdited): only the edited source counts,
+ * and an emptied cell means "skip", never "fall back to something else".
  * Manual mode: a filled id-style column (id / iNat URL / Observation URL)
- * wins, then header order.
+ * wins, then single lookup columns in header order, then the
+ * username+observed_on pair.
  */
-function resolveLookup(rowValues, lookupCols, editedCols) {
-  let candidates;
-  if (editedCols) {
-    candidates = lookupCols.filter(c => editedCols.indexOf(c.index) !== -1);
-  } else {
-    const idLike = lookupCols.find(c =>
-      isIdLookupName(c.name) && String(rowValues[c.index]).trim());
-    candidates = idLike ? [idLike] : lookupCols;
-  }
-  for (const col of candidates) {
+function resolveLookup(rowValues, lookupCols, userDate, editedCols, udEdited) {
+  const filled = ci => String(rowValues[ci]).trim() !== '';
+  const fromCol = col => {
     const raw = String(rowValues[col.index]).trim();
-    if (!raw) continue;
+    if (!raw) return null;
     if (isIdLookupName(col.name)) {
       const id = extractObservationId(raw);
       if (!id) return { name: 'id', value: raw, colIndex: col.index, invalid: true };
       return { name: 'id', value: id, colIndex: col.index };
     }
     return { name: col.name, value: raw, colIndex: col.index };
+  };
+  const userDateReady = userDate && filled(userDate.userCol) && filled(userDate.dateCol);
+  const idLikeFilled = lookupCols.some(c => isIdLookupName(c.name) && filled(c.index));
+
+  if (editedCols) {
+    for (const col of lookupCols) {
+      if (editedCols.indexOf(col.index) === -1) continue;
+      const resolved = fromCol(col);
+      if (resolved) return resolved;
+    }
+    // Pair edit resolves only when the row isn't already pinned to an id.
+    if (udEdited && userDateReady && !idLikeFilled) {
+      return makeUserDateLookup(rowValues, userDate);
+    }
+    return null;
+  }
+
+  const idLike = lookupCols.find(c => isIdLookupName(c.name) && filled(c.index));
+  const candidates = idLike ? [idLike] : lookupCols;
+  for (const col of candidates) {
+    const resolved = fromCol(col);
+    if (resolved) return resolved;
+  }
+  if (userDateReady) return makeUserDateLookup(rowValues, userDate);
+  return null;
+}
+
+function makeUserDateLookup(rowValues, userDate) {
+  const login = String(rowValues[userDate.userCol]).trim();
+  const rawWhen = String(rowValues[userDate.dateCol]).trim();
+  const when = parseWhen(rowValues[userDate.dateCol]);
+  if (!when) {
+    return {
+      name: USERDATE_NAME, value: `${login} @ ${rawWhen}`, colIndex: userDate.dateCol,
+      invalid: true, invalidMsg: 'Unrecognized date/time — use e.g. 2026-08-27 14:30'
+    };
+  }
+  return {
+    name: USERDATE_NAME, kind: 'userdate', login: login, when: when,
+    value: `${login} @ ${when.display}`, colIndex: userDate.dateCol
+  };
+}
+
+/**
+ * Parse a cell's date or date+time. Handles real Date values (what Sheets
+ * hands over for date-formatted cells; midnight counts as date-only),
+ * ISO-ish text (2026-08-27 14:30), and US M/D/Y text (8/27/2026 2:30 PM).
+ */
+function parseWhen(v) {
+  if (v instanceof Date && !isNaN(v)) {
+    const date = `${v.getFullYear()}-${pad2(v.getMonth() + 1)}-${pad2(v.getDate())}`;
+    const hasTime = v.getHours() !== 0 || v.getMinutes() !== 0;
+    const time = hasTime ? `${pad2(v.getHours())}:${pad2(v.getMinutes())}` : null;
+    return { date, time, display: date + (time ? ' ' + time : '') };
+  }
+  const s = String(v).trim();
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2}))?$/);
+  if (m) {
+    const date = `${m[1]}-${pad2(m[2])}-${pad2(m[3])}`;
+    const time = m[4] != null ? `${pad2(m[4])}:${m[5]}` : null;
+    return { date, time, display: date + (time ? ' ' + time : '') };
+  }
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[ ,]+(\d{1,2}):(\d{2})(?:\s*([AaPp])\.?[Mm]?\.?)?)?$/);
+  if (m) {
+    const year = m[3].length === 2 ? '20' + m[3] : m[3];
+    const date = `${year}-${pad2(m[1])}-${pad2(m[2])}`;
+    let time = null;
+    if (m[4] != null) {
+      let hh = parseInt(m[4], 10);
+      const ap = m[6] ? m[6].toLowerCase() : null;
+      if (ap === 'p' && hh < 12) hh += 12;
+      if (ap === 'a' && hh === 12) hh = 0;
+      time = `${pad2(hh)}:${m[5]}`;
+    }
+    return { date, time, display: date + (time ? ' ' + time : '') };
   }
   return null;
 }
+
+function pad2(n) { return String(n).padStart(2, '0'); }
 
 /** Accepts a bare observation id or a pasted iNaturalist observation URL. */
 function extractObservationId(raw) {
@@ -589,7 +680,13 @@ function readConfig(sheet) {
     if (matched) lookupCols.push({ index: idx, name: matched });
   });
 
-  return { headers, lookupCols, selectedFields: getSelectedFields() };
+  // The username + observed_on pair, when both columns exist.
+  const normed = headers.map(h => normalizeOFVName(h));
+  const userCol = normed.indexOf('username');
+  const dateCol = normed.indexOf('observedon');
+  const userDate = (userCol !== -1 && dateCol !== -1) ? { userCol, dateCol } : null;
+
+  return { headers, lookupCols, userDate, selectedFields: getSelectedFields() };
 }
 
 // === LOOKUP ===
@@ -668,6 +765,49 @@ function searchObservationsForOFV(ofvName, ofvValue) {
     obs: slimObservation(matches[0]),
     note: matches.length > 1 ? `${matches.length} observations share this value; used the most recent` : ''
   };
+}
+
+/**
+ * Find one observation by username + observed date (and optional time).
+ * The API filters server-side (user_login + on=YYYY-MM-DD); picking among
+ * same-day observations happens in pickObservationForUserDate.
+ */
+function searchByUserAndDate(login, when) {
+  const url = `${API_BASE}/observations?user_login=${encodeURIComponent(login)}` +
+              `&on=${when.date}&per_page=200&order_by=observed_on&order=asc`;
+  const json = fetchJson(url);
+  return pickObservationForUserDate(json?.results || [], login, when);
+}
+
+function pickObservationForUserDate(results, login, when) {
+  results = results.filter(o => (o?.observed_on || '') === when.date);
+  if (!results.length) return { obs: null, note: '' };
+  if (results.length === 1) return { obs: slimObservation(results[0]), note: '' };
+  if (!when.time) {
+    return { obs: null, note: `${results.length} observations by ${login} on ${when.date} — add a time (e.g. 14:30) to pick one` };
+  }
+  // Compare wall-clock observed times (both sides are the observer's local
+  // time, so no timezone math is needed or wanted).
+  const target = timeToMinutes(when.time);
+  let best = null, bestDiff = Infinity;
+  for (const o of results) {
+    const m = String(o?.time_observed_at || '').match(/T(\d{2}):(\d{2})/);
+    if (!m) continue;
+    const diff = Math.abs(parseInt(m[1], 10) * 60 + parseInt(m[2], 10) - target);
+    if (diff < bestDiff) { bestDiff = diff; best = o; }
+  }
+  if (!best) {
+    return { obs: null, note: `${results.length} observations that day, but none carry an observed time — can't pick by time` };
+  }
+  return {
+    obs: slimObservation(best),
+    note: `nearest of ${results.length} observations that day (${bestDiff} min off)`
+  };
+}
+
+function timeToMinutes(t) {
+  const p = t.split(':');
+  return parseInt(p[0], 10) * 60 + parseInt(p[1], 10);
 }
 
 /** Keep only the fields the extractors read — small enough to cache. */

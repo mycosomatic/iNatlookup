@@ -40,8 +40,19 @@ lookup column. Header matching ignores case, spacing, and punctuation, so
   number-extraction formulas needed. Formula-computed cells never fire
   edit triggers (a Sheets limitation), so scan into the lookup column
   directly rather than deriving it with SPLIT/REGEXEXTRACT.
-- When a lookup goes through an observation field, `id` is always written
-  back, so later runs can use the direct id path.
+- **Username + date/time pair:** a row with a filled `username` column and
+  a filled `observed_on` column (and no id) is looked up as a pair — for
+  collectors who can't find their observation number on the phone and
+  record "who + when" instead. One observation by that user that day
+  matches outright. Several that day: with a time given
+  (`2026-08-27 14:30`, `8/27/2026 2:30 PM`, or a real date-time cell), the
+  nearest observed time wins and the cell note says how close it was;
+  without a time, nothing fills and the note asks for one — for specimen
+  records a wrong guess is worse than a question. Both columns must exist
+  for the pair to be active. Text dates are read as ISO or US M/D/Y.
+- When a lookup goes through an observation field or the username+date
+  pair, `id` is always written back, so later runs can use the direct id
+  path.
 - If several observations share the same observation-field value, the most
   recent is used and the cell gets a note saying so.
 
