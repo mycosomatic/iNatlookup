@@ -40,6 +40,10 @@ lookup column. Header matching ignores case, spacing, and punctuation, so
   number-extraction formulas needed. Formula-computed cells never fire
   edit triggers (a Sheets limitation), so scan into the lookup column
   directly rather than deriving it with SPLIT/REGEXEXTRACT.
+- **Aliased headers:** `LOOKUP_HEADER_ALIASES` at the top of `Code.gs` maps
+  a sheet's own column name to the observation field the value really
+  lives in — out of the box, a `NAMA#` column searches the
+  `Voucher Number(s)` field. Add rows there for other local labels.
 - **Username + date/time pair:** a row with a filled `username` column and
   a filled `observed_on` column (and no id) is looked up as a pair — for
   collectors who can't find their observation number on the phone and

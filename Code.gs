@@ -77,6 +77,14 @@ function isIdLookupName(name) {
   return k === 'id' || k === 'inaturl' || k === 'observationurl';
 }
 
+// Lookup columns whose sheet header differs from the iNaturalist observation
+// field the value actually lives in: {column header: observation field}.
+// e.g. a "NAMA#" column holds NAMA voucher numbers, recorded on iNat in the
+// "Voucher Number(s)" field.
+const LOOKUP_HEADER_ALIASES = {
+  'NAMA#': 'Voucher Number(s)'
+};
+
 // Pair lookup: when a row has BOTH a username and an observed_on value (and
 // no id-style value), the two together find the observation — for collectors
 // who record "who + when" on a specimen instead of the observation number.
@@ -677,7 +685,10 @@ function readConfig(sheet) {
     const key = normalizeOFVName(h);
     if (!key) return;
     const matched = LOOKUP_OPTIONS.find(opt => normalizeOFVName(opt) === key);
-    if (matched) lookupCols.push({ index: idx, name: matched });
+    if (matched) { lookupCols.push({ index: idx, name: matched }); return; }
+    const alias = Object.keys(LOOKUP_HEADER_ALIASES)
+      .find(a => normalizeOFVName(a) === key);
+    if (alias) lookupCols.push({ index: idx, name: LOOKUP_HEADER_ALIASES[alias] });
   });
 
   // The username + observed_on pair, when both columns exist.
